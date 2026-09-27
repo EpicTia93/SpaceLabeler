@@ -107,11 +107,10 @@ final class MissionControlScanner {
                       range.upperBound == title.endIndex,
                       let number = Int(title.split(separator: " ").last ?? "") else { continue }
                 let possibleFrames = ([ownFrame].compactMap { $0 } + ancestors.reversed())
-                // Collapsed Spaces expose text and sometimes a shared strip group.
-                // Neither is an actual desktop preview, so require preview geometry.
+                // Match Dock's thumbnail container. The actual preview dimensions
+                // vary with display size and the number of desktops.
                 if let thumbnail = possibleFrames.first(where: {
-                    $0.width >= 120 && $0.height >= 80 && $0.height <= 300 &&
-                    (1.25...2.6).contains($0.width / $0.height)
+                    $0.width >= 70 && $0.height >= 40 && $0.height <= 300
                 }) {
                     hits.append((number, thumbnail))
                 }
@@ -245,6 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var holdStart = CGPoint.zero
     private var desktops: [Desktop] = []
     private var lastSignature = ""
+    private var lastAccessibilityState: Bool?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -268,7 +268,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] event in
             MainActor.assumeIsolated { self?.handleMouse(event) }
         }
-        if !AXIsProcessTrusted() { requestAccessibility(nil) }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -278,14 +277,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func poll() {
-        guard AXIsProcessTrusted() else { overlay.hide(); return }
+        let trusted = AXIsProcessTrusted()
+        if trusted != lastAccessibilityState {
+            lastAccessibilityState = trusted
+            refreshMenu()
+        }
+        guard trusted else {
+            overlay.hide()
+            lastSignature = ""
+            return
+        }
         let found = scanner.scan()
         let signature = found.map { "\($0.key):\($0.frame)" }.joined(separator: "|")
         guard signature != lastSignature else { return }
         lastSignature = signature
         if found.isEmpty {
             overlay.hide()
-            cancelHold()
         }
         else {
             desktops = found
@@ -310,7 +317,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let rect = CGRect(x: $0.frame.minX, y: primaryTop - $0.frame.maxY,
                                   width: $0.frame.width, height: $0.frame.height)
                 return rect.contains(point)
-            }), !scanner.scan().isEmpty else { return }
+            }) else { return }
             heldDesktop = desktop
             holdStart = point
             holdTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: false) { [weak self] _ in
@@ -343,6 +350,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         heading.isEnabled = false
         menu.addItem(heading)
         menu.addItem(.separator())
+        let access = NSMenuItem(
+            title: AXIsProcessTrusted() ? "Accessibility: enabled" : "Accessibility: denied to this build",
+            action: nil, keyEquivalent: ""
+        )
+        access.isEnabled = false
+        menu.addItem(access)
+        if !AXIsProcessTrusted() {
+            let help = NSMenuItem(title: "If already enabled, remove and add this app again", action: nil, keyEquivalent: "")
+            help.isEnabled = false
+            menu.addItem(help)
+        }
         let hint = NSMenuItem(title: "Press and hold a Desktop preview to label it", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
