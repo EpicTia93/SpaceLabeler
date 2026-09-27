@@ -238,6 +238,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let overlay = OverlayManager()
     private var statusItem: NSStatusItem!
     private var timer: Timer?
+    private var eventTap: CFMachPort?
+    private var eventTapSource: CFRunLoopSource?
     private var mouseMonitor: Any?
     private var holdTimer: Timer?
     private var heldDesktop: Desktop?
@@ -263,17 +265,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
-        mouseMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged]
-        ) { [weak self] event in
-            MainActor.assumeIsolated { self?.handleMouse(event) }
-        }
+        installMouseObserver()
+        refreshMenu()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }
+        if let eventTapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapSource, .commonModes) }
+        if let eventTap { CFMachPortInvalidate(eventTap) }
         holdTimer?.invalidate()
         timer?.invalidate()
+    }
+
+    private func installMouseObserver() {
+        let mask = (CGEventMask(1) << CGEventType.leftMouseDown.rawValue) |
+            (CGEventMask(1) << CGEventType.leftMouseUp.rawValue) |
+            (CGEventMask(1) << CGEventType.leftMouseDragged.rawValue)
+        eventTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap, place: .headInsertEventTap,
+            options: .listenOnly, eventsOfInterest: mask,
+            callback: { _, type, event, userInfo in
+                guard let userInfo else { return Unmanaged.passUnretained(event) }
+                let app = Unmanaged<AppDelegate>.fromOpaque(userInfo).takeUnretainedValue()
+                MainActor.assumeIsolated {
+                    app.handleMouse(type: type, point: event.location)
+                }
+                return Unmanaged.passUnretained(event)
+            },
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        )
+        if let eventTap {
+            eventTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+            if let eventTapSource {
+                CFRunLoopAddSource(CFRunLoopGetMain(), eventTapSource, .commonModes)
+                CGEvent.tapEnable(tap: eventTap, enable: true)
+            }
+        } else {
+            // Some Macs deny passive event taps. Keep a usable fallback.
+            mouseMonitor = NSEvent.addGlobalMonitorForEvents(
+                matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged]
+            ) { [weak self] event in
+                MainActor.assumeIsolated {
+                    let type: CGEventType
+                    switch event.type {
+                    case .leftMouseDown: type = .leftMouseDown
+                    case .leftMouseUp: type = .leftMouseUp
+                    default: type = .leftMouseDragged
+                    }
+                    self?.handleMouse(type: type, point: CGPoint(
+                        x: NSEvent.mouseLocation.x,
+                        y: (NSScreen.screens.first?.frame.maxY ?? 0) - NSEvent.mouseLocation.y
+                    ))
+                }
+            }
+        }
     }
 
     private func poll() {
@@ -307,16 +352,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         else { overlay.show(visible, preferences: preferences) }
     }
 
-    private func handleMouse(_ event: NSEvent) {
-        switch event.type {
+    private func handleMouse(type: CGEventType, point: CGPoint) {
+        switch type {
         case .leftMouseDown:
             cancelHold()
-            let point = NSEvent.mouseLocation
-            let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+            guard !lastSignature.isEmpty else { return }
             guard let desktop = desktops.first(where: {
-                let rect = CGRect(x: $0.frame.minX, y: primaryTop - $0.frame.maxY,
-                                  width: $0.frame.width, height: $0.frame.height)
-                return rect.contains(point)
+                $0.frame.insetBy(dx: -6, dy: -6).contains(point)
             }) else { return }
             heldDesktop = desktop
             holdStart = point
@@ -324,13 +366,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 MainActor.assumeIsolated {
                     guard let self, let target = self.heldDesktop else { return }
                     self.cancelHold()
-                    // Recheck because Mission Control may have closed during the hold.
-                    guard self.scanner.scan().contains(where: { $0.key == target.key }) else { return }
+                    guard AXIsProcessTrusted() else { return }
                     self.editLabel(for: target)
                 }
             }
         case .leftMouseDragged:
-            let point = NSEvent.mouseLocation
             if hypot(point.x - holdStart.x, point.y - holdStart.y) > 8 { cancelHold() }
         case .leftMouseUp:
             cancelHold()
@@ -364,6 +404,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hint = NSMenuItem(title: "Press and hold a Desktop preview to label it", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
+        let mouseStatus = NSMenuItem(
+            title: eventTap == nil ? "Hold detection: AppKit fallback" : "Hold detection: Quartz event tap",
+            action: nil, keyEquivalent: ""
+        )
+        mouseStatus.isEnabled = false
+        menu.addItem(mouseStatus)
+        let editMenu = NSMenuItem(title: "Edit labels…", action: nil, keyEquivalent: "")
+        let desktopMenu = NSMenu()
+        if desktops.isEmpty {
+            let help = NSMenuItem(title: "Open expanded Mission Control first", action: nil, keyEquivalent: "")
+            help.isEnabled = false
+            desktopMenu.addItem(help)
+        } else {
+            for (index, desktop) in desktops.enumerated() {
+                let label = preferences.label(for: desktop)
+                let item = NSMenuItem(
+                    title: "Desktop \(desktop.number)" + (label.isEmpty ? "" : " — \(label)"),
+                    action: #selector(editLabelFromMenu(_:)), keyEquivalent: ""
+                )
+                item.target = self
+                item.tag = index
+                desktopMenu.addItem(item)
+            }
+        }
+        menu.setSubmenu(desktopMenu, for: editMenu)
+        menu.addItem(editMenu)
         menu.addItem(.separator())
         let placement = NSMenuItem(title: "Label position", action: nil, keyEquivalent: "")
         let placementMenu = NSMenu()
@@ -416,6 +482,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             redrawVisibleLabels()
             refreshMenu()
         }
+    }
+
+    @objc private func editLabelFromMenu(_ sender: NSMenuItem) {
+        guard desktops.indices.contains(sender.tag) else { return }
+        editLabel(for: desktops[sender.tag])
     }
 
     @objc private func setPosition(_ sender: NSMenuItem) {

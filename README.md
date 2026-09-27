@@ -15,7 +15,7 @@ Allow **Space Labeler** in **System Settings → Privacy & Security → Accessib
 
 The app opens Accessibility Settings only when you choose that menu item. If the menu says **Accessibility: denied to this build** even though Space Labeler is enabled in Settings, remove its old entry, add the freshly built `dist/SpaceLabeler.app`, and enable it. The local build uses an ad hoc signature, so macOS may treat a rebuilt executable as a different Accessibility client.
 
-The menu also offers nine badge positions (corners, edges, and center), automatically varied colors, or one shared color chosen with the macOS color picker. Settings persist between launches. Unnamed Desktops have no badge.
+The menu also offers **Edit labels…** as a fallback, nine badge positions (corners, edges, and center), automatically varied colors, or one shared color chosen with the macOS color picker. Settings persist between launches. Unnamed Desktops have no badge.
 
 The app icon comes from `assets/logo.png`; the menu bar icon comes from `assets/top-bar-logo.png`.
 
