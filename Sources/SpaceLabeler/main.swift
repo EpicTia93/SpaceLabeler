@@ -107,7 +107,12 @@ final class MissionControlScanner {
                       range.upperBound == title.endIndex,
                       let number = Int(title.split(separator: " ").last ?? "") else { continue }
                 let possibleFrames = ([ownFrame].compactMap { $0 } + ancestors.reversed())
-                if let thumbnail = possibleFrames.first(where: { $0.width >= 70 && $0.height >= 40 && $0.height <= 300 }) {
+                // Collapsed Spaces expose text and sometimes a shared strip group.
+                // Neither is an actual desktop preview, so require preview geometry.
+                if let thumbnail = possibleFrames.first(where: {
+                    $0.width >= 120 && $0.height >= 80 && $0.height <= 300 &&
+                    (1.25...2.6).contains($0.width / $0.height)
+                }) {
                     hits.append((number, thumbnail))
                 }
             }
@@ -131,6 +136,17 @@ final class MissionControlScanner {
             let desktop = Desktop(number: hit.number, display: display, frame: hit.frame)
             if !result.contains(where: { $0.key == desktop.key }) { result.append(desktop) }
         }
+        // A shared AX container can look like a preview on some macOS versions.
+        // If two desktops resolve to substantially the same rectangle, wait for
+        // the strip to expand rather than stacking badges in one location.
+        let overlapping = result.contains { first in
+            result.contains { second in
+                first.key != second.key && first.display == second.display &&
+                first.frame.intersection(second.frame).width > first.frame.width * 0.5 &&
+                first.frame.intersection(second.frame).height > first.frame.height * 0.5
+            }
+        }
+        guard !overlapping else { return [] }
         return result.sorted { ($0.display, $0.number) < ($1.display, $1.number) }
     }
 }
