@@ -15,6 +15,8 @@ Allow **Space Labeler** in **System Settings → Privacy & Security → Accessib
 
 The menu also offers nine badge positions (corners, edges, and center), automatically varied colors, or one shared color chosen with the macOS color picker. Settings persist between launches. Unnamed Desktops have no badge.
 
+The app icon comes from `assets/logo.png`; the menu bar icon comes from `assets/top-bar-logo.png`.
+
 ## Current limits
 
 - Labels are associated with a display's **Desktop number**. If you reorder Desktops or macOS renumbers them, edit the affected labels in the menu.

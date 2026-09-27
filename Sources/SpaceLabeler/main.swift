@@ -249,7 +249,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "🏷"
+        if let url = Bundle.main.url(forResource: "top-bar-logo", withExtension: "png"),
+           let icon = NSImage(contentsOf: url) {
+            icon.size = NSSize(width: 21, height: 20)
+            statusItem.button?.image = icon
+            statusItem.button?.imageScaling = .scaleProportionallyDown
+        } else {
+            statusItem.button?.title = "🏷"
+        }
         statusItem.button?.toolTip = "Space Labeler"
         statusItem.menu = NSMenu()
         refreshMenu()
