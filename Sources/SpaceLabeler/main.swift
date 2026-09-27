@@ -239,6 +239,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let overlay = OverlayManager()
     private var statusItem: NSStatusItem!
     private var timer: Timer?
+    private var mouseMonitor: Any?
+    private var holdTimer: Timer?
+    private var heldDesktop: Desktop?
+    private var holdStart = CGPoint.zero
     private var desktops: [Desktop] = []
     private var lastSignature = ""
 
@@ -252,7 +256,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
+        mouseMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged]
+        ) { [weak self] event in
+            MainActor.assumeIsolated { self?.handleMouse(event) }
+        }
         if !AXIsProcessTrusted() { requestAccessibility(nil) }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }
+        holdTimer?.invalidate()
+        timer?.invalidate()
     }
 
     private func poll() {
@@ -261,7 +276,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let signature = found.map { "\($0.key):\($0.frame)" }.joined(separator: "|")
         guard signature != lastSignature else { return }
         lastSignature = signature
-        if found.isEmpty { overlay.hide() }
+        if found.isEmpty {
+            overlay.hide()
+            cancelHold()
+        }
         else {
             desktops = found
             overlay.show(found, preferences: preferences)
@@ -275,26 +293,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         else { overlay.show(visible, preferences: preferences) }
     }
 
+    private func handleMouse(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            cancelHold()
+            let point = NSEvent.mouseLocation
+            let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+            guard let desktop = desktops.first(where: {
+                let rect = CGRect(x: $0.frame.minX, y: primaryTop - $0.frame.maxY,
+                                  width: $0.frame.width, height: $0.frame.height)
+                return rect.contains(point)
+            }), !scanner.scan().isEmpty else { return }
+            heldDesktop = desktop
+            holdStart = point
+            holdTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let target = self.heldDesktop else { return }
+                    self.cancelHold()
+                    // Recheck because Mission Control may have closed during the hold.
+                    guard self.scanner.scan().contains(where: { $0.key == target.key }) else { return }
+                    self.editLabel(for: target)
+                }
+            }
+        case .leftMouseDragged:
+            let point = NSEvent.mouseLocation
+            if hypot(point.x - holdStart.x, point.y - holdStart.y) > 8 { cancelHold() }
+        case .leftMouseUp:
+            cancelHold()
+        default: break
+        }
+    }
+
+    private func cancelHold() {
+        holdTimer?.invalidate()
+        holdTimer = nil
+        heldDesktop = nil
+    }
+
     private func refreshMenu() {
         let menu = NSMenu()
         let heading = NSMenuItem(title: "Space Labeler", action: nil, keyEquivalent: "")
         heading.isEnabled = false
         menu.addItem(heading)
         menu.addItem(.separator())
-        if desktops.isEmpty {
-            let hint = NSMenuItem(title: "Open Mission Control to find desktops", action: nil, keyEquivalent: "")
-            hint.isEnabled = false
-            menu.addItem(hint)
-        } else {
-            for (index, desktop) in desktops.enumerated() {
-                let label = preferences.label(for: desktop)
-                let title = "Desktop \(desktop.number)" + (label.isEmpty ? "" : " — \(label)")
-                let item = NSMenuItem(title: title, action: #selector(editLabel(_:)), keyEquivalent: "")
-                item.target = self
-                item.tag = index
-                menu.addItem(item)
-            }
-        }
+        let hint = NSMenuItem(title: "Press and hold a Desktop preview to label it", action: nil, keyEquivalent: "")
+        hint.isEnabled = false
+        menu.addItem(hint)
         menu.addItem(.separator())
         let placement = NSMenuItem(title: "Label position", action: nil, keyEquivalent: "")
         let placementMenu = NSMenu()
@@ -332,9 +376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    @objc private func editLabel(_ sender: NSMenuItem) {
-        guard desktops.indices.contains(sender.tag) else { return }
-        let desktop = desktops[sender.tag]
+    private func editLabel(for desktop: Desktop) {
         let alert = NSAlert()
         alert.messageText = "Label Desktop \(desktop.number)"
         alert.informativeText = "Leave this empty to show no label."
