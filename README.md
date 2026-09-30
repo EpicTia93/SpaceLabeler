@@ -21,7 +21,8 @@ The app icon comes from `assets/logo.png`; the menu bar icon comes from `assets/
 
 ## Current limits
 
-- Labels are associated with a display's **Desktop number**. If you reorder Desktops or macOS renumbers them, edit the affected labels in the menu.
+- Labels follow each Desktop's macOS Space UUID when Desktops are reordered or removed. Existing number-based labels migrate the first time the app sees the expanded strip after an update.
+- Space UUIDs come from macOS's Spaces configuration, which is not a documented API. The app waits for the configuration and thumbnail counts to agree before drawing labels.
 - Mission Control's Accessibility layout is not a documented API. A macOS update may require an adjustment to the thumbnail scanner.
 - The overlays and press-and-hold editing work only when Mission Control exposes its expanded Desktop thumbnails. Full-screen app thumbnails are not labeled.
 - The app needs Accessibility permission to read Dock's thumbnail positions. It does not use screen recording, inject code into Dock, or disable System Integrity Protection.

@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import ColorSync
 
 enum LabelPosition: String, CaseIterable {
     case topLeft = "Top left"
@@ -22,7 +23,10 @@ struct Desktop: Hashable {
     let number: Int
     let display: Int
     let frame: CGRect // Accessibility coordinates: origin at the upper left of the primary display.
-    var key: String { "display-\(display)-desktop-\(number)" }
+    let spaceUUID: String
+    let displayUUID: String
+    var key: String { spaceUUID }
+    var legacyKey: String { "display-\(display)-desktop-\(number)" }
 }
 
 @MainActor
@@ -58,12 +62,89 @@ final class Preferences {
         if trimmed.isEmpty { defaults.removeObject(forKey: key) }
         else { defaults.set(trimmed, forKey: key) }
     }
+
+    func migrateLegacyLabels(for desktops: [Desktop]) {
+        for group in Dictionary(grouping: desktops, by: \.displayUUID) {
+            let displayUUID = group.key
+            let marker = "migratedLabels.\(displayUUID)"
+            guard !defaults.bool(forKey: marker), let first = group.value.first else { continue }
+            let prefix = "label.display-\(first.display)-desktop-"
+            for desktop in group.value {
+                let oldKey = "label.\(desktop.legacyKey)"
+                let newKey = "label.\(desktop.key)"
+                if defaults.object(forKey: newKey) == nil,
+                   let label = defaults.string(forKey: oldKey) {
+                    defaults.set(label, forKey: newKey)
+                }
+            }
+            for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(prefix) {
+                defaults.removeObject(forKey: key)
+            }
+            defaults.set(true, forKey: marker)
+        }
+    }
+}
+
+// Dock's numbered AX previews are positional. The Spaces preference keeps the
+// UUIDs in that same order, so a deleted desktop cannot transfer its label to
+// the desktop that takes its number.
+@MainActor
+final class SpaceIdentityResolver {
+    private func displayUUID(_ screen: NSScreen) -> String? {
+        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+              let uuid = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)?.takeRetainedValue()
+        else { return nil }
+        return CFUUIDCreateString(nil, uuid) as String
+    }
+
+    func resolve(_ desktops: [DesktopPreview], screens: [NSScreen]) -> [Desktop]? {
+        guard CFPreferencesAppSynchronize("com.apple.spaces" as CFString),
+              let configuration = CFPreferencesCopyAppValue(
+                "SpacesDisplayConfiguration" as CFString, "com.apple.spaces" as CFString
+              ) as? [String: Any],
+              let management = configuration["Management Data"] as? [String: Any],
+              let monitors = management["Monitors"] as? [[String: Any]]
+        else { return nil }
+
+        var resolved: [Desktop] = []
+        for (display, previews) in Dictionary(grouping: desktops, by: \.display) {
+            guard screens.indices.contains(display),
+                  let screenUUID = displayUUID(screens[display]),
+                  let screenNumber = screens[display].deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+            else { return nil }
+            let identifier = screenNumber.uint32Value == CGMainDisplayID() ? "Main" : screenUUID
+            guard let monitor = monitors.first(where: {
+                ($0["Display Identifier"] as? String)?.caseInsensitiveCompare(identifier) == .orderedSame
+            }), let spaces = monitor["Spaces"] as? [[String: Any]] else { return nil }
+            let uuids = spaces.compactMap { space -> String? in
+                guard (space["type"] as? Int) == 0 else { return nil }
+                return space["uuid"] as? String
+            }
+            guard !uuids.isEmpty, previews.count == uuids.count,
+                  Set(previews.map(\.number)) == Set(1...uuids.count),
+                  Set(uuids).count == uuids.count else { return nil }
+            for preview in previews {
+                resolved.append(Desktop(number: preview.number, display: display,
+                                        frame: preview.frame, spaceUUID: uuids[preview.number - 1],
+                                        displayUUID: screenUUID))
+            }
+        }
+        return resolved.sorted { ($0.display, $0.number) < ($1.display, $1.number) }
+    }
+}
+
+struct DesktopPreview {
+    let number: Int
+    let display: Int
+    let frame: CGRect
+    var key: String { "display-\(display)-desktop-\(number)" }
 }
 
 // Mission Control is owned by Dock. Its accessibility tree exposes desktop
 // thumbnails while the Spaces strip is expanded. We read it; we never modify Dock.
 @MainActor
 final class MissionControlScanner {
+    private let identities = SpaceIdentityResolver()
     private func value(_ element: AXUIElement, _ key: CFString) -> AnyObject? {
         var result: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, key, &result) == .success else { return nil }
@@ -123,7 +204,7 @@ final class MissionControlScanner {
 
         // Keep only thumbnail-sized frames in the upper portion of each screen.
         let screens = NSScreen.screens
-        var result: [Desktop] = []
+        var result: [DesktopPreview] = []
         for hit in hits {
             guard let display = screens.firstIndex(where: { screen in
                 let bounds = screen.frame
@@ -132,7 +213,7 @@ final class MissionControlScanner {
                                       width: bounds.width, height: bounds.height)
                 return axBounds.intersects(hit.frame) && hit.frame.midY < axBounds.minY + min(300, bounds.height * 0.4)
             }) else { continue }
-            let desktop = Desktop(number: hit.number, display: display, frame: hit.frame)
+            let desktop = DesktopPreview(number: hit.number, display: display, frame: hit.frame)
             if !result.contains(where: { $0.key == desktop.key }) { result.append(desktop) }
         }
         // A shared AX container can look like a preview on some macOS versions.
@@ -146,7 +227,7 @@ final class MissionControlScanner {
             }
         }
         guard !overlapping else { return [] }
-        return result.sorted { ($0.display, $0.number) < ($1.display, $1.number) }
+        return identities.resolve(result, screens: screens) ?? []
     }
 }
 
@@ -333,6 +414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let found = scanner.scan()
+        if !found.isEmpty { preferences.migrateLegacyLabels(for: found) }
         let signature = found.map { "\($0.key):\($0.frame)" }.joined(separator: "|")
         guard signature != lastSignature else { return }
         lastSignature = signature
@@ -348,6 +430,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func redrawVisibleLabels() {
         let visible = scanner.scan()
+        if !visible.isEmpty { preferences.migrateLegacyLabels(for: visible) }
         if visible.isEmpty { overlay.hide() }
         else { overlay.show(visible, preferences: preferences) }
     }
