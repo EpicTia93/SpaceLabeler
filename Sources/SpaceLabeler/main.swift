@@ -234,17 +234,17 @@ final class MissionControlScanner {
 final class BadgeView: NSView {
     var title = "" { didSet { needsDisplay = true } }
     var fill = NSColor.systemBlue { didSet { needsDisplay = true } }
+    var onClick: (() -> Void)?
     override var isOpaque: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { onClick?() }
     override func draw(_ dirtyRect: NSRect) {
         let rect = bounds.insetBy(dx: 1, dy: 1)
         fill.setFill()
         NSBezierPath(roundedRect: rect, xRadius: 9, yRadius: 9).fill()
-        let luminance = fill.usingColorSpace(.deviceRGB).map {
-            0.2126 * $0.redComponent + 0.7152 * $0.greenComponent + 0.0722 * $0.blueComponent
-        } ?? 0
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
-            .foregroundColor: luminance > 0.62 ? NSColor.black : NSColor.white
+            .foregroundColor: BadgeStyle.textColor(on: fill)
         ]
         let size = (title as NSString).size(withAttributes: attributes)
         (title as NSString).draw(at: CGPoint(x: (bounds.width - size.width) / 2,
@@ -254,61 +254,280 @@ final class BadgeView: NSView {
 }
 
 @MainActor
-final class OverlayManager {
-    private var windows: [NSPanel] = []
-    private let palette: [NSColor] = [
+enum BadgeStyle {
+    static let height: CGFloat = 30
+    private static let palette: [NSColor] = [
         .systemOrange, .systemGreen, .systemBlue, .systemPink,
         .systemPurple, .systemTeal, .systemYellow, .systemRed
     ]
 
+    static func fill(for desktop: Desktop, preferences: Preferences) -> NSColor {
+        preferences.colorMode == .uniform
+            ? preferences.sharedColor
+            : palette[(desktop.number - 1) % palette.count]
+    }
+
+    static func textColor(on fill: NSColor) -> NSColor {
+        let luminance = fill.usingColorSpace(.deviceRGB).map {
+            0.2126 * $0.redComponent + 0.7152 * $0.greenComponent + 0.0722 * $0.blueComponent
+        } ?? 0
+        return luminance > 0.62 ? .black : .white
+    }
+
+    static func width(for label: String, thumbnail: CGRect) -> CGFloat {
+        min(max(CGFloat(label.count) * 8 + 28, 60), max(40, thumbnail.width - 10))
+    }
+
+    // Returns an AppKit frame for a badge of the given width inside the thumbnail.
+    static func frame(width: CGFloat, thumbnail: CGRect, position: LabelPosition) -> CGRect {
+        let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+        let margin: CGFloat = 5
+        let axY: CGFloat
+        switch position {
+        case .topLeft, .topCenter, .topRight: axY = thumbnail.minY + margin
+        case .middleLeft, .center, .middleRight: axY = thumbnail.midY - height / 2
+        case .bottomLeft, .bottomCenter, .bottomRight: axY = thumbnail.maxY - height - margin
+        }
+        let axX: CGFloat
+        switch position {
+        case .topLeft, .middleLeft, .bottomLeft: axX = thumbnail.minX + margin
+        case .topCenter, .center, .bottomCenter: axX = thumbnail.midX - width / 2
+        case .topRight, .middleRight, .bottomRight: axX = thumbnail.maxX - width - margin
+        }
+        return CGRect(x: axX, y: primaryTop - axY - height, width: width, height: height)
+    }
+}
+
+@MainActor
+final class OverlayManager {
+    private var windows: [(panel: NSPanel, desktop: Desktop)] = []
+    private var addButton: NSPanel?
+    private var addButtonDesktop: Desktop?
+    // The badge for this desktop stays hidden while its inline editor is open.
+    var editingKey: String?
+    var onSelect: ((Desktop) -> Void)?
+
     func show(_ desktops: [Desktop], preferences: Preferences) {
         hide()
-        let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
-        for desktop in desktops {
+        for desktop in desktops where desktop.key != editingKey {
             let label = preferences.label(for: desktop)
             guard !label.isEmpty else { continue }
-            let thumbnail = desktop.frame
-            let width = min(max(CGFloat(label.count) * 8 + 28, 60), max(40, thumbnail.width - 10))
-            let height: CGFloat = 30
-            let margin: CGFloat = 5
-            let axY: CGFloat
-            switch preferences.position {
-            case .topLeft, .topCenter, .topRight: axY = thumbnail.minY + margin
-            case .middleLeft, .center, .middleRight: axY = thumbnail.midY - height / 2
-            case .bottomLeft, .bottomCenter, .bottomRight: axY = thumbnail.maxY - height - margin
-            }
-            let axX: CGFloat
-            switch preferences.position {
-            case .topLeft, .middleLeft, .bottomLeft: axX = thumbnail.minX + margin
-            case .topCenter, .center, .bottomCenter: axX = thumbnail.midX - width / 2
-            case .topRight, .middleRight, .bottomRight: axX = thumbnail.maxX - width - margin
-            }
-            let appKitFrame = CGRect(x: axX,
-                                     y: primaryTop - axY - height,
-                                     width: width, height: height)
-            let panel = NSPanel(contentRect: appKitFrame, styleMask: [.borderless, .nonactivatingPanel],
-                                backing: .buffered, defer: false)
-            panel.isOpaque = false
-            panel.backgroundColor = .clear
-            panel.hasShadow = true
-            panel.ignoresMouseEvents = true
-            panel.hidesOnDeactivate = false
-            panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-            panel.level = .screenSaver
+            let appKitFrame = BadgeStyle.frame(
+                width: BadgeStyle.width(for: label, thumbnail: desktop.frame),
+                thumbnail: desktop.frame, position: preferences.position
+            )
+            let panel = makePanel(frame: appKitFrame)
             let badge = BadgeView(frame: CGRect(origin: .zero, size: appKitFrame.size))
             badge.title = label
-            badge.fill = preferences.colorMode == .uniform
-                ? preferences.sharedColor
-                : palette[(desktop.number - 1) % palette.count]
+            badge.fill = BadgeStyle.fill(for: desktop, preferences: preferences)
+            badge.onClick = { [weak self] in self?.onSelect?(desktop) }
+            badge.toolTip = "Click to rename"
             panel.contentView = badge
             panel.orderFrontRegardless()
-            windows.append(panel)
+            windows.append((panel, desktop))
         }
     }
 
+    // Unlabeled desktops have no badge to click, so hovering one shows a
+    // faint pill that opens the editor.
+    func showAddButton(for desktop: Desktop?, preferences: Preferences) {
+        guard desktop?.key != addButtonDesktop?.key else { return }
+        hideAddButton()
+        guard let desktop else { return }
+        addButtonDesktop = desktop
+        let title = "Add label"
+        let frame = BadgeStyle.frame(width: BadgeStyle.width(for: title, thumbnail: desktop.frame),
+                                     thumbnail: desktop.frame, position: preferences.position)
+        let panel = makePanel(frame: frame)
+        let badge = BadgeView(frame: CGRect(origin: .zero, size: frame.size))
+        badge.title = title
+        badge.fill = BadgeStyle.fill(for: desktop, preferences: preferences).withAlphaComponent(0.6)
+        badge.onClick = { [weak self] in self?.onSelect?(desktop) }
+        panel.contentView = badge
+        panel.orderFrontRegardless()
+        addButton = panel
+    }
+
+    // Returns the desktop whose label or "Add label" pill is under the point.
+    func desktop(atAxPoint point: CGPoint) -> Desktop? {
+        let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+        let appKitPoint = CGPoint(x: point.x, y: primaryTop - point.y)
+        if let addButton, let addButtonDesktop, addButton.frame.contains(appKitPoint) {
+            return addButtonDesktop
+        }
+        return windows.first { $0.panel.frame.contains(appKitPoint) }?.desktop
+    }
+
     func hide() {
-        for window in windows { window.orderOut(nil); window.close() }
+        for window in windows { window.panel.orderOut(nil); window.panel.close() }
         windows.removeAll()
+        hideAddButton()
+    }
+
+    private func hideAddButton() {
+        addButton?.orderOut(nil)
+        addButton?.close()
+        addButton = nil
+        addButtonDesktop = nil
+    }
+
+    private func makePanel(frame: CGRect) -> NSPanel {
+        let panel = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        panel.level = .screenSaver
+        return panel
+    }
+}
+
+final class EditorPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+// A text field drawn in the badge's place, directly over the Mission Control
+// thumbnail. The panel is non-activating so Space Labeler never comes to the
+// front, which would close Mission Control.
+@MainActor
+final class InlineLabelEditor: NSObject, NSTextFieldDelegate {
+    let desktop: Desktop
+    private let panel: EditorPanel
+    private let field = NSTextField()
+    private var onFinish: ((String?) -> Void)?
+    private var resignObserver: NSObjectProtocol?
+
+    private let commitsOnResignKey: Bool
+
+    init(desktop: Desktop, preferences: Preferences, commitsOnResignKey: Bool,
+         onFinish: @escaping (String?) -> Void) {
+        self.desktop = desktop
+        self.commitsOnResignKey = commitsOnResignKey
+        self.onFinish = onFinish
+        let thumbnail = desktop.frame
+        // Never narrower than the badge it replaces, so the click that opened
+        // the editor is not mistaken for a click outside it.
+        let width = max(min(max(thumbnail.width - 10, 60), 220),
+                        BadgeStyle.width(for: preferences.label(for: desktop), thumbnail: thumbnail))
+        let frame = BadgeStyle.frame(width: width, thumbnail: thumbnail, position: preferences.position)
+        panel = EditorPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+        super.init()
+
+        let fill = BadgeStyle.fill(for: desktop, preferences: preferences)
+        let textColor = BadgeStyle.textColor(on: fill)
+        let background = BadgeView(frame: CGRect(origin: .zero, size: frame.size))
+        background.fill = fill
+        let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        let fieldHeight = ceil(font.ascender - font.descender + font.leading) + 2
+        field.frame = CGRect(x: 8, y: (frame.height - fieldHeight) / 2,
+                             width: frame.width - 16, height: fieldHeight)
+        field.isBezeled = false
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.alignment = .center
+        field.font = font
+        field.textColor = textColor
+        field.usesSingleLineMode = true
+        field.cell?.isScrollable = true
+        field.cell?.wraps = false
+        field.stringValue = preferences.label(for: desktop)
+        field.placeholderAttributedString = NSAttributedString(string: "Desktop \(desktop.number)", attributes: [
+            .font: font, .foregroundColor: textColor.withAlphaComponent(0.55)
+        ])
+        field.delegate = self
+        background.addSubview(field)
+
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        panel.level = .screenSaver
+        panel.contentView = background
+    }
+
+    func begin() {
+        panel.orderFrontRegardless()
+        panel.makeKey()
+        panel.makeFirstResponder(field)
+        (field.currentEditor() as? NSTextView)?.insertionPointColor = field.textColor
+        field.currentEditor()?.selectAll(nil)
+        // Without a filtering event tap there is no other way to notice the
+        // user moving on, so leaving the field saves it.
+        guard commitsOnResignKey else { return }
+        resignObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification, object: panel, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.commit() }
+        }
+    }
+
+    func contains(axPoint point: CGPoint) -> Bool {
+        let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+        return panel.frame.contains(CGPoint(x: point.x, y: primaryTop - point.y))
+    }
+
+    // Clicks reach the editor through the event tap rather than the window
+    // server, so place the caret here instead of running AppKit's tracking loop.
+    func click(atAxPoint point: CGPoint, clickCount: Int) {
+        guard let textView = field.currentEditor() as? NSTextView else { return }
+        if clickCount >= 2 { textView.selectAll(nil); return }
+        let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+        let windowPoint = panel.convertPoint(fromScreen: CGPoint(x: point.x, y: primaryTop - point.y))
+        let index = textView.characterIndexForInsertion(at: textView.convert(windowPoint, from: nil))
+        textView.setSelectedRange(NSRange(location: index, length: 0))
+    }
+
+    func commit() { finish(field.stringValue) }
+    func cancel() { finish(nil) }
+
+    // Mission Control may keep keyboard focus for itself, so the event tap
+    // hands key events to the editor directly. Returns true when consumed.
+    func handleKey(_ cgEvent: CGEvent) -> Bool {
+        guard let event = NSEvent(cgEvent: cgEvent) else { return false }
+        if event.type == .keyDown, event.modifierFlags.contains(.command) {
+            guard let editor = field.currentEditor() as? NSTextView else { return false }
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "a": editor.selectAll(nil)
+            case "c": editor.copy(nil)
+            case "v": editor.pasteAsPlainText(nil)
+            case "x": editor.cut(nil)
+            case "z":
+                if event.modifierFlags.contains(.shift) { editor.undoManager?.redo() }
+                else { editor.undoManager?.undo() }
+            default: return false
+            }
+            return true
+        }
+        guard event.type == .keyDown || event.type == .keyUp else { return false }
+        panel.sendEvent(event)
+        return true
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        switch selector {
+        case #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.insertTab(_:)):
+            commit()
+        case #selector(NSResponder.cancelOperation(_:)):
+            cancel()
+        default:
+            return false
+        }
+        return true
+    }
+
+    private func finish(_ value: String?) {
+        guard let onFinish else { return }
+        self.onFinish = nil
+        if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
+        panel.orderOut(nil)
+        panel.close()
+        onFinish(value)
     }
 }
 
@@ -319,12 +538,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let overlay = OverlayManager()
     private var statusItem: NSStatusItem!
     private var timer: Timer?
+    private var pointerTimer: Timer?
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
-    private var mouseMonitor: Any?
-    private var holdTimer: Timer?
-    private var heldDesktop: Desktop?
-    private var holdStart = CGPoint.zero
+    private var polledButtonDown = false
+    private var editor: InlineLabelEditor?
+    private var swallowedKeyCodes: Set<Int64> = []
+    // True from a swallowed mouse-down until its mouse-up.
+    private var ownsMousePress = false
     private var desktops: [Desktop] = []
     private var lastSignature = ""
     private var lastAccessibilityState: Bool?
@@ -342,36 +563,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         statusItem.button?.toolTip = "Space Labeler"
         statusItem.menu = NSMenu()
+        overlay.onSelect = { [weak self] desktop in self?.beginInlineEdit(for: desktop) }
         refreshMenu()
         timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
-        installMouseObserver()
+        installEventTap()
+        // Mission Control does not reliably deliver mouse events to event taps,
+        // so hover and outside clicks are detected by polling the pointer.
+        pointerTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pollPointer() }
+        }
         refreshMenu()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }
-        if let eventTapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapSource, .commonModes) }
-        if let eventTap { CFMachPortInvalidate(eventTap) }
-        holdTimer?.invalidate()
+        removeEventTap()
+        pointerTimer?.invalidate()
         timer?.invalidate()
     }
 
-    private func installMouseObserver() {
-        let mask = (CGEventMask(1) << CGEventType.leftMouseDown.rawValue) |
-            (CGEventMask(1) << CGEventType.leftMouseUp.rawValue) |
-            (CGEventMask(1) << CGEventType.leftMouseDragged.rawValue)
+    private func installEventTap() {
+        guard eventTap == nil else { return }
+        let events = (CGEventMask(1) << CGEventType.keyDown.rawValue) |
+            (CGEventMask(1) << CGEventType.keyUp.rawValue) |
+            (CGEventMask(1) << CGEventType.leftMouseDown.rawValue) |
+            (CGEventMask(1) << CGEventType.leftMouseDragged.rawValue) |
+            (CGEventMask(1) << CGEventType.leftMouseUp.rawValue)
+        // Mission Control's Dock receives clicks even over our windows. A
+        // HID-level tap runs before Dock, so it can claim clicks on labels and
+        // keystrokes for the editor before Mission Control acts on them.
         eventTap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap, place: .headInsertEventTap,
-            options: .listenOnly, eventsOfInterest: mask,
+            tap: .cghidEventTap, place: .headInsertEventTap,
+            options: .defaultTap, eventsOfInterest: events,
             callback: { _, type, event, userInfo in
                 guard let userInfo else { return Unmanaged.passUnretained(event) }
                 let app = Unmanaged<AppDelegate>.fromOpaque(userInfo).takeUnretainedValue()
-                MainActor.assumeIsolated {
-                    app.handleMouse(type: type, point: event.location)
+                let consumed = MainActor.assumeIsolated {
+                    app.handleTapEvent(type: type, event: event)
                 }
-                return Unmanaged.passUnretained(event)
+                return consumed ? nil : Unmanaged.passUnretained(event)
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         )
@@ -381,32 +612,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 CFRunLoopAddSource(CFRunLoopGetMain(), eventTapSource, .commonModes)
                 CGEvent.tapEnable(tap: eventTap, enable: true)
             }
-        } else {
-            // Some Macs deny passive event taps. Keep a usable fallback.
-            mouseMonitor = NSEvent.addGlobalMonitorForEvents(
-                matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged]
-            ) { [weak self] event in
-                MainActor.assumeIsolated {
-                    let type: CGEventType
-                    switch event.type {
-                    case .leftMouseDown: type = .leftMouseDown
-                    case .leftMouseUp: type = .leftMouseUp
-                    default: type = .leftMouseDragged
-                    }
-                    self?.handleMouse(type: type, point: CGPoint(
-                        x: NSEvent.mouseLocation.x,
-                        y: (NSScreen.screens.first?.frame.maxY ?? 0) - NSEvent.mouseLocation.y
-                    ))
-                }
-            }
         }
+    }
+
+    private func removeEventTap() {
+        if let eventTapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapSource, .commonModes) }
+        if let eventTap { CFMachPortInvalidate(eventTap) }
+        eventTapSource = nil
+        eventTap = nil
+    }
+
+    private func handleTapEvent(type: CGEventType, event: CGEvent) -> Bool {
+        switch type {
+        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
+            return false
+        case .keyDown, .keyUp:
+            let code = event.getIntegerValueField(.keyboardEventKeycode)
+            if type == .keyUp, swallowedKeyCodes.remove(code) != nil {
+                _ = editor?.handleKey(event)
+                return true
+            }
+            guard editor?.handleKey(event) == true else { return false }
+            if type == .keyDown { swallowedKeyCodes.insert(code) }
+            return true
+        case .leftMouseDown:
+            return handleMouseDown(event)
+        case .leftMouseDragged, .leftMouseUp:
+            let owned = ownsMousePress
+            if type == .leftMouseUp { ownsMousePress = false }
+            return owned
+        default:
+            return false
+        }
+    }
+
+    // Hover is only visible by polling while Mission Control is open. Without
+    // an event tap, this also notices clicks outside the editor.
+    // Decides synchronously whether the click is ours; the work itself runs
+    // after the tap returns so a Dock accessibility scan cannot stall input.
+    private func handleMouseDown(_ event: CGEvent) -> Bool {
+        let point = event.location
+        if let editor, editor.contains(axPoint: point) {
+            let clickCount = Int(event.getIntegerValueField(.mouseEventClickState))
+            DispatchQueue.main.async { editor.click(atAxPoint: point, clickCount: clickCount) }
+            ownsMousePress = true
+            return true
+        }
+        let target = overlay.desktop(atAxPoint: point)
+        let editor = self.editor
+        guard editor != nil || target != nil else { return false }
+        DispatchQueue.main.async { [weak self] in
+            editor?.commit()
+            if let target { self?.beginInlineEdit(for: target) }
+        }
+        ownsMousePress = target != nil
+        return ownsMousePress
+    }
+
+    private func pollPointer() {
+        let down = CGEventSource.buttonState(.combinedSessionState, button: .left)
+            || NSEvent.pressedMouseButtons & 1 != 0
+        let mouse = NSEvent.mouseLocation
+        let point = CGPoint(x: mouse.x,
+                            y: (NSScreen.screens.first?.frame.maxY ?? 0) - mouse.y)
+        if eventTap == nil, down && !polledButtonDown, let editor, !editor.contains(axPoint: point) {
+            editor.commit()
+        }
+        polledButtonDown = down
+        let hovered = lastSignature.isEmpty || editor != nil ? nil : desktops.first {
+            $0.frame.contains(point) && preferences.label(for: $0).isEmpty
+        }
+        overlay.showAddButton(for: hovered, preferences: preferences)
     }
 
     private func poll() {
         let trusted = AXIsProcessTrusted()
         if trusted != lastAccessibilityState {
             lastAccessibilityState = trusted
+            // Creating the tap fails until Accessibility is granted, and a
+            // re-granted permission does not revive a tap made before it.
+            removeEventTap()
+            if trusted { installEventTap() }
             refreshMenu()
+        } else if trusted && eventTap == nil {
+            installEventTap()
+            if eventTap != nil { refreshMenu() }
         }
         guard trusted else {
             overlay.hide()
@@ -419,6 +710,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard signature != lastSignature else { return }
         lastSignature = signature
         if found.isEmpty {
+            // Mission Control closed; keep what was typed.
+            editor?.commit()
             overlay.hide()
         }
         else {
@@ -433,38 +726,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !visible.isEmpty { preferences.migrateLegacyLabels(for: visible) }
         if visible.isEmpty { overlay.hide() }
         else { overlay.show(visible, preferences: preferences) }
-    }
-
-    private func handleMouse(type: CGEventType, point: CGPoint) {
-        switch type {
-        case .leftMouseDown:
-            cancelHold()
-            guard !lastSignature.isEmpty else { return }
-            guard let desktop = desktops.first(where: {
-                $0.frame.insetBy(dx: -6, dy: -6).contains(point)
-            }) else { return }
-            heldDesktop = desktop
-            holdStart = point
-            holdTimer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: false) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    guard let self, let target = self.heldDesktop else { return }
-                    self.cancelHold()
-                    guard AXIsProcessTrusted() else { return }
-                    self.editLabel(for: target)
-                }
-            }
-        case .leftMouseDragged:
-            if hypot(point.x - holdStart.x, point.y - holdStart.y) > 8 { cancelHold() }
-        case .leftMouseUp:
-            cancelHold()
-        default: break
-        }
-    }
-
-    private func cancelHold() {
-        holdTimer?.invalidate()
-        holdTimer = nil
-        heldDesktop = nil
     }
 
     private func refreshMenu() {
@@ -484,15 +745,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             help.isEnabled = false
             menu.addItem(help)
         }
-        let hint = NSMenuItem(title: "Press and hold a Desktop preview to label it", action: nil, keyEquivalent: "")
+        let hint = NSMenuItem(title: "Click a label in Mission Control to rename it", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
-        let mouseStatus = NSMenuItem(
-            title: eventTap == nil ? "Hold detection: AppKit fallback" : "Hold detection: Quartz event tap",
+        let keyStatus = NSMenuItem(
+            title: "Input: " + (eventTap == nil ? "window focus (labels may not be clickable)" : "HID event tap"),
             action: nil, keyEquivalent: ""
         )
-        mouseStatus.isEnabled = false
-        menu.addItem(mouseStatus)
+        keyStatus.isEnabled = false
+        menu.addItem(keyStatus)
         let editMenu = NSMenuItem(title: "Edit labels…", action: nil, keyEquivalent: "")
         let desktopMenu = NSMenu()
         if desktops.isEmpty {
@@ -550,7 +811,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    private func editLabel(for desktop: Desktop) {
+    private func beginInlineEdit(for desktop: Desktop) {
+        editor?.commit()
+        let editor = InlineLabelEditor(
+            desktop: desktop, preferences: preferences, commitsOnResignKey: eventTap == nil
+        ) { [weak self] value in
+            guard let self else { return }
+            self.editor = nil
+            self.overlay.editingKey = nil
+            if let value { self.preferences.setLabel(value, for: desktop) }
+            self.redrawVisibleLabels()
+            self.refreshMenu()
+        }
+        self.editor = editor
+        overlay.editingKey = desktop.key
+        overlay.show(desktops, preferences: preferences)
+        editor.begin()
+    }
+
+    // Menu fallback for when Mission Control is not open to edit in place.
+    private func editLabelInAlert(for desktop: Desktop) {
         let alert = NSAlert()
         alert.messageText = "Label Desktop \(desktop.number)"
         alert.informativeText = "Leave this empty to show no label."
@@ -569,7 +849,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func editLabelFromMenu(_ sender: NSMenuItem) {
         guard desktops.indices.contains(sender.tag) else { return }
-        editLabel(for: desktops[sender.tag])
+        editLabelInAlert(for: desktops[sender.tag])
     }
 
     @objc private func setPosition(_ sender: NSMenuItem) {
